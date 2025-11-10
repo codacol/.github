@@ -1,42 +1,85 @@
-name: Trigger Jenkins Job
+name: Trigger Jenkins Job (Reusable)
 
 on:
   workflow_call:
     inputs:
       job_name:
-        description: "The Jenkins job name to trigger"
+        description: "Optional: Jenkins job name (if omitted and use_repo_name=true, repo name will be used)"
         required: false
         type: string
       token:
-        description: "The Jenkins job token"
+        description: "Optional: job token override (if you want to pass a token from the caller)"
         required: false
         type: string
       use_repo_name:
-        description: "If true, use repo name as Jenkins job"
+        description: "If true (default), use the repo name as Jenkins job when job_name not given"
         required: false
-        default: true
         type: boolean
+        default: true
 
 jobs:
   trigger:
     runs-on: self-hosted
+
     steps:
-      - name: Determine Jenkins Job Name
+      - name: Resolve job name
         id: resolve
         run: |
-          if [ "${{ inputs.use_repo_name }}" = "true" ]; then
+          if [ "${{ inputs.use_repo_name }}" = "true" ] && [ -z "${{ inputs.job_name }}" ]; then
             JOB_NAME=$(basename "${GITHUB_REPOSITORY}")
           else
             JOB_NAME="${{ inputs.job_name }}"
           fi
+          if [ -z "$JOB_NAME" ]; then
+            echo "No JOB_NAME available; exiting with error."
+            exit 1
+          fi
           echo "job=$JOB_NAME" >> $GITHUB_OUTPUT
 
       - name: Trigger Jenkins
+        env:
+          # these are pulled from GitHub Secrets (organization-level recommended)
+          JENKINS_URL: ${{ secrets.JENKINS_URL }}
+          JENKINS_JOB_TOKEN: ${{ secrets.JENKINS_JOB_TOKEN }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          # inputs
+          INPUT_TOKEN: ${{ inputs.token }}
         run: |
           JOB_NAME="${{ steps.resolve.outputs.job }}"
           echo "Triggering Jenkins job: $JOB_NAME"
 
-          curl -s -o /dev/null -w "%{http_code}\n" \
-            -X POST "http://localhost:8080/job/${JOB_NAME}/buildWithParameters?token=${TOKEN}&branch=${GITHUB_REF_NAME}&commit=${GITHUB_SHA}"
-        env:
-          TOKEN: ${{ inputs.token || 'MY_DEFAULT_TOKEN' }}
+          # prefer explicit input token (workflow caller) -> JENKINS_JOB_TOKEN -> empty
+          TOKEN="$INPUT_TOKEN"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$JENKINS_JOB_TOKEN"
+          fi
+
+          # build the Jenkins URL; append branch/commit as parameters
+          # use buildWithParameters so your Jenkins job can accept branch/commit variables
+          if [ -n "$TOKEN" ]; then
+            ENDPOINT="${JENKINS_URL%/}/job/${JOB_NAME}/buildWithParameters?token=${TOKEN}&branch=${GITHUB_REF_NAME}&commit=${GITHUB_SHA}"
+          else
+            ENDPOINT="${JENKINS_URL%/}/job/${JOB_NAME}/buildWithParameters?branch=${GITHUB_REF_NAME}&commit=${GITHUB_SHA}"
+          fi
+
+          echo "POST -> $ENDPOINT"
+
+          # if API user & token are provided, use basic auth; otherwise just POST (local network / job token)
+          if [ -n "$JENKINS_USER" ] && [ -n "$JENKINS_API_TOKEN" ]; then
+            HTTP_CODE=$(curl -s -u "${JENKINS_USER}:${JENKINS_API_TOKEN}" -X POST -w "%{http_code}" -o /tmp/jenkins_resp.txt "$ENDPOINT" || true)
+          else
+            HTTP_CODE=$(curl -s -X POST -w "%{http_code}" -o /tmp/jenkins_resp.txt "$ENDPOINT" || true)
+          fi
+
+          echo "HTTP response code: $HTTP_CODE"
+          echo "Response (truncated):"
+          head -n 50 /tmp/jenkins_resp.txt || true
+
+          # consider 200/201/302 as success depending on your Jenkins setup
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+            echo "Triggered successfully."
+          else
+            echo "Failed to trigger Jenkins (HTTP $HTTP_CODE)."
+            exit 1
+          fi
