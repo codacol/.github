@@ -1,0 +1,42 @@
+name: Trigger Jenkins Job
+
+on:
+  workflow_call:
+    inputs:
+      job_name:
+        description: "The Jenkins job name to trigger"
+        required: false
+        type: string
+      token:
+        description: "The Jenkins job token"
+        required: false
+        type: string
+      use_repo_name:
+        description: "If true, use repo name as Jenkins job"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  trigger:
+    runs-on: self-hosted
+    steps:
+      - name: Determine Jenkins Job Name
+        id: resolve
+        run: |
+          if [ "${{ inputs.use_repo_name }}" = "true" ]; then
+            JOB_NAME=$(basename "${GITHUB_REPOSITORY}")
+          else
+            JOB_NAME="${{ inputs.job_name }}"
+          fi
+          echo "job=$JOB_NAME" >> $GITHUB_OUTPUT
+
+      - name: Trigger Jenkins
+        run: |
+          JOB_NAME="${{ steps.resolve.outputs.job }}"
+          echo "Triggering Jenkins job: $JOB_NAME"
+
+          curl -s -o /dev/null -w "%{http_code}\n" \
+            -X POST "http://localhost:8080/job/${JOB_NAME}/buildWithParameters?token=${TOKEN}&branch=${GITHUB_REF_NAME}&commit=${GITHUB_SHA}"
+        env:
+          TOKEN: ${{ inputs.token || 'MY_DEFAULT_TOKEN' }}
